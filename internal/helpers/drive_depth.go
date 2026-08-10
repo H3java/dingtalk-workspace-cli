@@ -350,7 +350,7 @@ bfs:
 type driveLatestScope struct {
 	// flags 是原调用的查询域 flag 串（如 "--workspace ws-1" / "--space-id sp-1"），无则空串。
 	flags string
-	// depth 是原调用的 --depth 层数，让恢复命令给出确切层数而非 <原层数> 占位符。
+	// depth 是原调用的 --depth 层数，让「去掉 --latest 重跑」的恢复命令给出确切层数。
 	depth int
 }
 
@@ -374,15 +374,6 @@ func (s driveLatestScope) base() string {
 		return "dws drive list"
 	}
 	return "dws drive list " + s.flags
-}
-
-// depthFlag 仅在原调用是多层时给出 --depth：depth==1（知识库 --latest 单层）时 partial+errors[]
-// 契约本就不成立，硬塞 --depth 1 会让子句自相矛盾。
-func (s driveLatestScope) depthFlag() string {
-	if s.depth > 1 {
-		return fmt.Sprintf(" --depth %d", s.depth)
-	}
-	return ""
 }
 
 // driveLatestIncompleteError 是排序基不完整时的拒绝产出错误。截断与目录失败共用
@@ -425,7 +416,7 @@ func driveLatestFolderFailureCause(errs []driveDepthError) string {
 // driveLatestIncompleteSuggestion 按实际触发的成因给恢复指引。约束两条：
 //  1. 每条示例命令都带原查询域（scope.base()），照抄不会切换查询域；
 //  2. 每个子句的示例命令与该子句正文一致——「去掉 --latest」的子句示例不带 --latest，
-//     否则照抄复现同一错误。partial+errors[] 承诺限定 --depth>1，故该子句只在多层时给出。
+//     否则照抄复现同一错误。
 func driveLatestIncompleteSuggestion(latest int, truncated, folderFailed bool, scope driveLatestScope) string {
 	base := scope.base()
 	clauses := make([]string, 0, 3)
@@ -441,8 +432,10 @@ func driveLatestIncompleteSuggestion(latest int, truncated, folderFailed bool, s
 	default:
 		clauses = append(clauses, fmt.Sprintf("缩小扫描范围后重试：--folder 指定子目录，或降低 --depth 层数，如 %s --folder <子目录ID> --latest %d", base, latest))
 	}
+	// partial+errors[] 承诺限定 --depth>1：单层去掉 --latest 会路由回普通单层 list，本就无
+	// errors[] 契约，故该子句只在多层时给出，并直接带上原层数。
 	if folderFailed && scope.depth > 1 {
-		clauses = append(clauses, fmt.Sprintf("需要看失败明细请去掉 --latest 按原范围重跑（同时输出已扫到的 partial 与 errors[] 明细）：%s --folder <目录ID>%s", base, scope.depthFlag()))
+		clauses = append(clauses, fmt.Sprintf("需要看失败明细请去掉 --latest 按原范围重跑（同时输出已扫到的 partial 与 errors[] 明细）：%s --folder <目录ID> --depth %d", base, scope.depth))
 	}
 	return strings.Join(clauses, "；")
 }
