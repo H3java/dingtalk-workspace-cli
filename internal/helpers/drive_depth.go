@@ -338,23 +338,78 @@ bfs:
 	// BFS 序与修改时间无关：截断与递归途中目录失败都让未扫区域可能含更新文件，
 	// 此时的 Top-N 不是全局最新，两者同属一条防线——拒绝以成功状态产出。
 	if latest > 0 && (truncated || len(errs) > 0) {
-		return driveLatestIncompleteError(latest, truncated, errs)
+		return driveLatestIncompleteError(latest, truncated, errs, driveLatestScopeFromCmd(cmd, maxDepth))
 	}
 
 	return emitDriveDepthResult(collected, errs, truncated, pattern, latest, maxDepth)
 }
 
-// driveLatestIncompleteError 是排序基不完整时的拒绝产出错误。截断与目录失败共用
-// CodeContentTruncated（→ ExitAPI），但 token 分开，便于消费方区分「范围太大」与「读不到」。
-// 拒绝产出后 errors[] 不再进 stdout，失败详情必须落在错误消息里，否则用户完全瞎。
-func driveLatestIncompleteError(latest int, truncated bool, errs []driveDepthError) error {
-	if truncated || len(errs) == 0 { // len==0 只可能来自截断分支；调用点已保证二者至少一真
-		return &CLIError{
-			Code:       CodeContentTruncated,
-			Message:    fmt.Sprintf("LATEST_SCAN_TRUNCATED: 扫描在全局上限 %d 条处截断，未扫描区域可能含更新文件，拒绝输出不完整的 Top-%d", driveDepthMaxItems, latest),
-			Suggestion: fmt.Sprintf("缩小扫描范围后重试：--folder 指定子目录，或降低 --depth 层数，如 dws drive list --folder <子目录ID> --latest %d", latest),
-		}
+// driveLatestScope 是原调用的查询域快照，用于生成不改变查询域的恢复命令。恢复命令若丢掉
+// --workspace/--space-id，用户照抄就会从知识库切到普通钉盘（或反之），在另一个域里拿到一份
+// 「看起来对」的 Top-N —— 比报错更难发现。
+type driveLatestScope struct {
+	// flags 是原调用的查询域 flag 串（如 "--workspace ws-1" / "--space-id sp-1"），无则空串。
+	flags string
+	// depth 是原调用的 --depth 层数，让恢复命令给出确切层数而非 <原层数> 占位符。
+	depth int
+}
+
+// driveLatestScopeFromCmd 从原命令抽查询域。--workspace 决定路由（知识库 vs 钉盘），判定与
+// drive list 里的路由分支同源（同一个 flagOrFallback(cmd, "workspace", "workspace-id")）；
+// 钉盘侧的 --space-id 同样必须保留。目录 flag 名无需按路由切换：docFolderFlag 的主 flag 就是
+// --folder，两条路由都接受。
+func driveLatestScopeFromCmd(cmd *cobra.Command, depth int) driveLatestScope {
+	if workspaceID := flagOrFallback(cmd, "workspace", "workspace-id"); workspaceID != "" {
+		return driveLatestScope{flags: "--workspace " + workspaceID, depth: depth}
 	}
+	if spaceID, _ := cmd.Flags().GetString("space-id"); spaceID != "" {
+		return driveLatestScope{flags: "--space-id " + spaceID, depth: depth}
+	}
+	return driveLatestScope{depth: depth}
+}
+
+// base 是恢复命令的公共前缀，始终带上原查询域。
+func (s driveLatestScope) base() string {
+	if s.flags == "" {
+		return "dws drive list"
+	}
+	return "dws drive list " + s.flags
+}
+
+// depthFlag 仅在原调用是多层时给出 --depth：depth==1（知识库 --latest 单层）时 partial+errors[]
+// 契约本就不成立，硬塞 --depth 1 会让子句自相矛盾。
+func (s driveLatestScope) depthFlag() string {
+	if s.depth > 1 {
+		return fmt.Sprintf(" --depth %d", s.depth)
+	}
+	return ""
+}
+
+// driveLatestIncompleteError 是排序基不完整时的拒绝产出错误。截断与目录失败共用
+// CodeContentTruncated（→ ExitAPI），但 token 分开，便于消费方区分「范围太大」与「读不到」；
+// 二者同真时两个 token 都带。拒绝产出后 errors[] 不再进 stdout，失败详情必须落在错误消息里，
+// 否则用户完全瞎。调用点已保证 truncated 与 len(errs)>0 至少一真。
+func driveLatestIncompleteError(latest int, truncated bool, errs []driveDepthError, scope driveLatestScope) error {
+	// 目录失败详情排在截断之前：BFS 可以先记下可恢复目录错误、再在别的目录撞上 2000 上限，
+	// 此时 permission_denied 这类 reason 是用户唯一能动手修的线索，不能被截断提示吞掉。
+	causes := make([]string, 0, 2)
+	if len(errs) > 0 {
+		causes = append(causes, driveLatestFolderFailureCause(errs))
+	}
+	if truncated {
+		causes = append(causes, fmt.Sprintf("LATEST_SCAN_TRUNCATED: 扫描在全局上限 %d 条处截断", driveDepthMaxItems))
+	}
+	return &CLIError{
+		Code: CodeContentTruncated,
+		Message: fmt.Sprintf("%s，未扫描区域可能含更新文件，拒绝输出不完整的 Top-%d",
+			strings.Join(causes, "；同时 "), latest),
+		Suggestion: driveLatestIncompleteSuggestion(latest, truncated, len(errs) > 0, scope),
+	}
+}
+
+// driveLatestFolderFailureCause 组装目录失败详情，含首个失败的 folder/depth/reason。
+// folderName 空回落 folderID，两者都空回落 <root>。
+func driveLatestFolderFailureCause(errs []driveDepthError) string {
 	first := errs[0]
 	folder := first.FolderName
 	if folder == "" {
@@ -363,14 +418,33 @@ func driveLatestIncompleteError(latest int, truncated bool, errs []driveDepthErr
 	if folder == "" {
 		folder = "<root>"
 	}
-	return &CLIError{
-		Code: CodeContentTruncated,
-		Message: fmt.Sprintf("LATEST_SCAN_INCOMPLETE: %d 个目录未读全（首个失败 folder=%s depth=%d reason=%s: %s），未扫描区域可能含更新文件，拒绝输出不完整的 Top-%d",
-			len(errs), folder, first.Depth, first.Reason, first.Message, latest),
-		// partial+errors[] 承诺限定 --depth>1：单层去掉 --latest 会路由回普通单层 list，本就无 errors[] 契约。
-		// 每个子句的示例命令与该子句正文一致——「去掉 --latest」的子句示例不带 --latest（否则照抄复现同一错误）。
-		Suggestion: fmt.Sprintf("确认目录权限后重试；或用 --folder 缩小到可读子目录后重取 Top-%d：dws drive list --folder <可读子目录ID> --latest %d；需要看失败明细请去掉 --latest 按原范围重跑（--depth>1 时同时输出已扫到的 partial 与 errors[] 明细）：dws drive list --folder <目录ID> --depth <原层数>", latest, latest),
+	return fmt.Sprintf("LATEST_SCAN_INCOMPLETE: %d 个目录未读全（首个失败 folder=%s depth=%d reason=%s: %s）",
+		len(errs), folder, first.Depth, first.Reason, first.Message)
+}
+
+// driveLatestIncompleteSuggestion 按实际触发的成因给恢复指引。约束两条：
+//  1. 每条示例命令都带原查询域（scope.base()），照抄不会切换查询域；
+//  2. 每个子句的示例命令与该子句正文一致——「去掉 --latest」的子句示例不带 --latest，
+//     否则照抄复现同一错误。partial+errors[] 承诺限定 --depth>1，故该子句只在多层时给出。
+func driveLatestIncompleteSuggestion(latest int, truncated, folderFailed bool, scope driveLatestScope) string {
+	base := scope.base()
+	clauses := make([]string, 0, 3)
+	if folderFailed {
+		clauses = append(clauses, "确认目录权限后重试")
 	}
+	switch {
+	case folderFailed && truncated:
+		// 两个成因都要解：既要换到可读目录，也要把范围缩到 2000 条以内。
+		clauses = append(clauses, fmt.Sprintf("或用 --folder 缩小到可读子目录、并降低 --depth 层数后重取 Top-%d：%s --folder <可读子目录ID> --latest %d", latest, base, latest))
+	case folderFailed:
+		clauses = append(clauses, fmt.Sprintf("或用 --folder 缩小到可读子目录后重取 Top-%d：%s --folder <可读子目录ID> --latest %d", latest, base, latest))
+	default:
+		clauses = append(clauses, fmt.Sprintf("缩小扫描范围后重试：--folder 指定子目录，或降低 --depth 层数，如 %s --folder <子目录ID> --latest %d", base, latest))
+	}
+	if folderFailed && scope.depth > 1 {
+		clauses = append(clauses, fmt.Sprintf("需要看失败明细请去掉 --latest 按原范围重跑（同时输出已扫到的 partial 与 errors[] 明细）：%s --folder <目录ID>%s", base, scope.depthFlag()))
+	}
+	return strings.Join(clauses, "；")
 }
 
 func emitDriveDepthCancelled(items []map[string]any, errs []driveDepthError, pattern string, latest, reqDepth int) error {
